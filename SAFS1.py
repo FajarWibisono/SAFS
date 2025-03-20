@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -212,6 +212,31 @@ def get_ratio_data(stocks):
             except:
                 earnings_yield = None
 
+            # Current Ratio - NEW
+            try:
+                if 'Current Assets' in balance_sheet.index and 'Current Liabilities' in balance_sheet.index:
+                    current_assets = balance_sheet.loc['Current Assets'].iloc[0]
+                    current_liabilities = balance_sheet.loc['Current Liabilities'].iloc[0]
+                    if current_liabilities != 0:
+                        current_ratio = current_assets / current_liabilities
+                    else:
+                        current_ratio = None
+                else:
+                    current_ratio = None
+            except:
+                current_ratio = None
+
+            # PEG Ratio - NEW
+            try:
+                peg_ratio = info.get('pegRatio', None)
+                if not peg_ratio:
+                    # Try to calculate if we have PE and growth rate
+                    growth_rate = info.get('earningsGrowth', None)
+                    if pe_ratio and growth_rate and growth_rate != 0:
+                        peg_ratio = pe_ratio / (growth_rate * 100)
+            except:
+                peg_ratio = None
+
             # Store results
             results[stock] = {
                 "ROE": roe,
@@ -223,7 +248,9 @@ def get_ratio_data(stocks):
                 "Operating Margin": op_margin,
                 "GPM": gpm,
                 "ROA": roa,
-                "Earnings Yield": earnings_yield
+                "Earnings Yield": earnings_yield,
+                "Current Ratio": current_ratio,  # NEW
+                "PEG Ratio": peg_ratio  # NEW
             }
 
         except Exception as e:
@@ -238,7 +265,9 @@ def get_ratio_data(stocks):
                 "Operating Margin": None,
                 "GPM": None,
                 "ROA": None,
-                "Earnings Yield": None
+                "Earnings Yield": None,
+                "Current Ratio": None,  # NEW
+                "PEG Ratio": None  # NEW
             }
             prices[stock] = None
 
@@ -423,6 +452,36 @@ def evaluate_ratios(ratio_data):
         else:
             evaluations[stock]["Earnings Yield"] = "N/A"
 
+        # Current Ratio - NEW
+        cr = ratios["Current Ratio"]
+        if cr is not None:
+            if cr > 2:
+                evaluations[stock]["Current Ratio"] = "Baik"
+                scores[stock] += 2
+                good_count += 1
+            elif 1 <= cr <= 2:
+                evaluations[stock]["Current Ratio"] = "Biasa"
+                scores[stock] += 1
+            else:
+                evaluations[stock]["Current Ratio"] = "Buruk"
+        else:
+            evaluations[stock]["Current Ratio"] = "N/A"
+
+        # PEG Ratio - NEW with UPDATED criteria
+        peg = ratios["PEG Ratio"]
+        if peg is not None:
+            if peg > 0 and peg < 1:  # Changed: Positive and less than 1
+                evaluations[stock]["PEG Ratio"] = "Baik"
+                scores[stock] += 2
+                good_count += 1
+            elif peg == 1 or (0.9 <= peg <= 1.1):  # Approximately 1
+                evaluations[stock]["PEG Ratio"] = "Biasa"
+                scores[stock] += 1
+            else:  # Greater than 1 or negative
+                evaluations[stock]["PEG Ratio"] = "Buruk"
+        else:
+            evaluations[stock]["PEG Ratio"] = "N/A"
+
     return evaluations, scores
 
 # Function to display results in the new format
@@ -438,7 +497,9 @@ def display_results(ratio_data, evaluations, scores):
         "Operating Margin",
         "GPM",
         "ROA",
-        "Earnings Yield"
+        "Earnings Yield",
+        "Current Ratio",  # NEW
+        "PEG Ratio"  # NEW
     ]
 
     # Prepare data for the DataFrame
@@ -469,7 +530,7 @@ def display_results(ratio_data, evaluations, scores):
                             formatted_value = f"{value * 100:.2f}%"
                         else:
                             formatted_value = f"{value:.2f}%"
-                    elif ratio in ["DER", "P/E", "P/B", "P/S"]:
+                    elif ratio in ["DER", "P/E", "P/B", "P/S", "Current Ratio", "PEG Ratio"]:
                         formatted_value = f"{value:.2f}"
                     else:
                         formatted_value = f"{value:.2f}%"
@@ -534,7 +595,7 @@ def display_results(ratio_data, evaluations, scores):
                     if current_value is not None and isinstance(current_value, float):
                         if ratio == "Dividend Yield" and current_value <= 1:
                             display_value = f"Current: {current_value * 100:.2f}%"
-                        elif ratio in ["DER", "P/E", "P/B", "P/S"]:
+                        elif ratio in ["DER", "P/E", "P/B", "P/S", "Current Ratio", "PEG Ratio"]:
                             display_value = f"Current: {current_value:.2f}"
                         else:
                             display_value = f"Current: {current_value:.2f}%"
@@ -557,6 +618,23 @@ def display_results(ratio_data, evaluations, scores):
 
             if not has_na_values:
                 st.info("Semua nilai rasio sudah tersedia. Input manual akan menggantikan nilai yang ada.")
+
+    # Add "Analisa Kembali" button here (moved from main app logic)
+    if st.button("Analisa Kembali", key="reanalyze_button_inside"):
+        if not stocks:
+            st.error("Masukkan minimal satu kode saham untuk dianalisis.")
+        else:
+            with st.spinner('Menganalisis ulang data fundamental...'):
+                if st.session_state.ratio_data:
+                    # Use existing data but re-evaluate with updated manual inputs
+                    ratio_data = st.session_state.ratio_data
+                    evaluations, scores = evaluate_ratios(ratio_data)
+                    st.session_state.evaluations = evaluations
+                    st.session_state.scores = scores
+                    # Set flag to display results
+                    st.session_state.should_display_results = True
+                    # Force rerun to display results
+                    st.rerun()
 
     # Generate recommendations
     st.subheader("REKOMENDASI")
@@ -583,7 +661,6 @@ def display_results(ratio_data, evaluations, scores):
 
 # Main app logic - Consolidated flow
 analyze_button = st.button("Analisis Fundamental")
-reanalyze_button = st.button("Analisa Kembali")
 
 # Handle button clicks
 if analyze_button:
@@ -603,33 +680,6 @@ if analyze_button:
             st.session_state.should_display_results = True
             # Force rerun to display results
             st.rerun()
-
-elif reanalyze_button:
-    if not stocks:
-        st.error("Masukkan minimal satu kode saham untuk dianalisis.")
-    else:
-        with st.spinner('Menganalisis ulang data fundamental...'):
-            if st.session_state.ratio_data:
-                # Use existing data but re-evaluate with updated manual inputs
-                ratio_data = st.session_state.ratio_data
-                evaluations, scores = evaluate_ratios(ratio_data)
-                st.session_state.evaluations = evaluations
-                st.session_state.scores = scores
-                # Set flag to display results
-                st.session_state.should_display_results = True
-                # Force rerun to display results
-                st.rerun()
-            else:
-                # If no data exists yet, get fresh data
-                ratio_data = get_ratio_data(stocks)
-                st.session_state.ratio_data = ratio_data
-                evaluations, scores = evaluate_ratios(ratio_data)
-                st.session_state.evaluations = evaluations
-                st.session_state.scores = scores
-                # Set flag to display results
-                st.session_state.should_display_results = True
-                # Force rerun to display results
-                st.rerun()
 
 # Display results if needed
 if st.session_state.should_display_results and st.session_state.ratio_data and stocks:
