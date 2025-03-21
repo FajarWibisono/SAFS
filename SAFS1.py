@@ -10,7 +10,7 @@ st.set_page_config(page_title="🔍 SAFS", layout="wide")
 
 # App title and description
 st.title("📊 Screening Awal Fundamental Saham")
-st.markdown("Aplikasi ini membantu Anda untuk menganalisa dan membandingkan Saham yang menarik perhatian  Anda untuk investasi. **Aplikasi ini TIDAK BERLAKU untuk emiten perBANKan.**. Aplikasi ini secara otomatis akan membandingkan berbagai RATIO FUNDAMENTAL dari **maksimal 7 saham** yang Anda masukkan, dan Memilih 3 yang terbaik diantara lainnya. **Happy Cuan!!!**")
+st.markdown("Aplikasi ini membantu Anda untuk menganalisa dan membandingkan Saham yang menarik perhatian  Anda untuk investasi. **Aplikasi ini TIDAK BERLAKU untuk emiten perBANKan.** Aplikasi ini secara otomatis akan membandingkan berbagai RATIO FUNDAMENTAL dari **maksimal 7 saham** yang Anda masukkan, dan Memilih 3 yang terbaik diantara lainnya. **Happy Cuan!!!**")
 
 # Initialize flag for tracking if we need to display results
 if 'should_display_results' not in st.session_state:
@@ -683,7 +683,7 @@ def display_results(ratio_data, evaluations, scores):
     # Generate recommendations
     st.subheader("REKOMENDASI")
 
-    # Filter stocks with at least 5 "Baik" ratings
+    # Filter stocks with at least 7 "Baik" ratings
     good_counts = {stock: sum(1 for val in evals.values() if val == "Baik") for stock, evals in evaluations.items()}
     qualified_stocks = {stock: scores[stock] for stock in stocks if good_counts[stock] >= 5}
 
@@ -697,7 +697,7 @@ def display_results(ratio_data, evaluations, scores):
         for i, (stock, score) in enumerate(top_stocks, 1):
             st.write(f"{i}. **{stock}** - Total Score: {score}, Kriteria Baik: {good_counts[stock]}")
     else:
-        st.write("Tidak ada Rekomendasi (Minimal 5 rasio dengan kriteria Baik)")
+        st.write("Tidak ada Rekomendasi (Minimal 7 rasio harus dengan kriteria Baik)")
 
     # Display current date
     current_date = dt.datetime.now().strftime("%d %B %Y")
