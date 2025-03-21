@@ -520,8 +520,8 @@ def display_results(ratio_data, evaluations, scores):
         "GPM",
         "ROA",
         "Earnings Yield",
-        "Current Ratio",  # NEW
-        "PEG Ratio"  # NEW
+        "Current Ratio",  
+        "PEG Ratio" 
     ]
 
     # Prepare data for the DataFrame
@@ -579,8 +579,8 @@ def display_results(ratio_data, evaluations, scores):
             data.append(row_data)
 
     # Create column headers
-    # First level: SAHAM, PRICE, ratio names, ESTIMATED EPS, and TARGET PRICE
-    # Second level: Empty for SAHAM/PRICE/ESTIMATED EPS/TARGET PRICE, "Value" and "Penilaian" for ratios
+    # First level: SAHAM, PRICE, ratio names, est.EPS, and TARGET PRICE
+    # Second level: Empty for SAHAM/PRICE/est.EPS/TARGET PRICE, "Value" and "Penilaian" for ratios
     header_level_1 = ['SAHAM', 'PRICE']
     header_level_2 = ['', '']
 
@@ -588,8 +588,8 @@ def display_results(ratio_data, evaluations, scores):
         header_level_1.extend([ratio, ratio])
         header_level_2.extend(['Value', 'Penilaian'])
 
-    # Add ESTIMATED EPS after PEG Ratio
-    header_level_1.append('ESTIMATED EPS')
+    # Add est.EPS after PEG Ratio
+    header_level_1.append('est.EPS')
     header_level_2.append('')
 
     # Add TARGET PRICE at the end
