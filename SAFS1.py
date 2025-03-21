@@ -50,10 +50,18 @@ if 'scores' not in st.session_state:
 if 'stock_prices' not in st.session_state:
     st.session_state.stock_prices = {}
 
+if 'target_prices' not in st.session_state:
+    st.session_state.target_prices = {}
+
+if 'estimated_eps' not in st.session_state:
+    st.session_state.estimated_eps = {}
+
 # Function to get ratio data
 def get_ratio_data(stocks):
     results = {}
     prices = {}
+    target_prices = {}
+    estimated_eps_values = {}
 
     for stock in stocks:
         try:
@@ -73,6 +81,16 @@ def get_ratio_data(stocks):
                             current_price = hist['Close'].iloc[-1]
 
                     prices[stock] = current_price
+
+                    # Get target price
+                    target_mean_price = info.get('targetMeanPrice', None)
+                    target_prices[stock] = target_mean_price
+
+                    # Get estimated EPS
+                    estimated_eps = info.get('forwardEps', None)
+                    if estimated_eps is None:
+                        estimated_eps = info.get('trailingEps', None)  # Fallback to trailing if forward not available
+                    estimated_eps_values[stock] = estimated_eps
 
                     # Get financial data with longer timeframe
                     financials = ticker.financials
@@ -270,9 +288,13 @@ def get_ratio_data(stocks):
                 "PEG Ratio": None  # NEW
             }
             prices[stock] = None
+            target_prices[stock] = None
+            estimated_eps_values[stock] = None
 
-    # Store prices in session state
+    # Store values in session state
     st.session_state.stock_prices = prices
+    st.session_state.target_prices = target_prices
+    st.session_state.estimated_eps = estimated_eps_values
     return results
 
 # Function to evaluate ratios
@@ -540,17 +562,39 @@ def display_results(ratio_data, evaluations, scores):
                 penilaian = evaluations[stock][ratio] if stock in evaluations else "N/A"
                 row_data.extend([formatted_value, penilaian])
 
+            # Add Estimated EPS after PEG Ratio
+            estimated_eps = st.session_state.estimated_eps.get(stock, None)
+            if estimated_eps is not None:
+                row_data.append(f"{estimated_eps:.2f}")
+            else:
+                row_data.append("N/A")
+
+            # Add target price as the last column
+            target_price = st.session_state.target_prices.get(stock, None)
+            if target_price is not None:
+                row_data.append(f"{target_price:.2f}")
+            else:
+                row_data.append("N/A")
+
             data.append(row_data)
 
     # Create column headers
-    # First level: SAHAM, PRICE, and ratio names
-    # Second level: Empty for SAHAM/PRICE, "Value" and "Penilaian" for ratios
+    # First level: SAHAM, PRICE, ratio names, ESTIMATED EPS, and TARGET PRICE
+    # Second level: Empty for SAHAM/PRICE/ESTIMATED EPS/TARGET PRICE, "Value" and "Penilaian" for ratios
     header_level_1 = ['SAHAM', 'PRICE']
     header_level_2 = ['', '']
 
     for ratio in ratios:
         header_level_1.extend([ratio, ratio])
         header_level_2.extend(['Value', 'Penilaian'])
+
+    # Add ESTIMATED EPS after PEG Ratio
+    header_level_1.append('ESTIMATED EPS')
+    header_level_2.append('')
+
+    # Add TARGET PRICE at the end
+    header_level_1.append('TARGET PRICE')
+    header_level_2.append('')
 
     # Create multi-index columns
     column_tuples = list(zip(header_level_1, header_level_2))
