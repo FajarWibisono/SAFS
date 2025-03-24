@@ -379,7 +379,7 @@ def evaluate_ratios(ratio_data):
         # P/S
         ps = ratios["P/S"]
         if ps is not None:
-            if ps < 1:
+            if 0 < ps < 1:
                 evaluations[stock]["P/S"] = "Baik"
                 scores[stock] += 2
                 good_count += 1
