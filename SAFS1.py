@@ -10,7 +10,7 @@ st.set_page_config(page_title="🔍 SAFS", layout="wide")
 
 # App title and description
 st.title("📊 Screening Awal Fundamental Saham")
-st.markdown("Aplikasi ini membantu Anda untuk menganalisa dan membandingkan Saham yang menarik perhatian  Anda untuk investasi. **Aplikasi ini TIDAK BERLAKU untuk emiten perBANKan.** Aplikasi ini secara otomatis akan membandingkan berbagai RATIO FUNDAMENTAL dari **maksimal 7 saham** yang Anda masukkan, dan Memilih 3 yang terbaik diantara lainnya. **Happy Cuan!!!**")
+st.markdown("Aplikasi ini membantu Anda untuk menganalisa dan membandingkan Saham yang menarik perhatian  Anda untuk investasi. **APLIKASI TIDAK BERLAKU UNTUK EMITEN perBANKan.** Aplikasi ini secara otomatis akan membandingkan berbagai RATIO FUNDAMENTAL dari **maksimal 7 saham** yang Anda masukkan, dan Memilih 3 yang terbaik diantara lainnya. **Happy Cuan!!!**")
 
 # Initialize flag for tracking if we need to display results
 if 'should_display_results' not in st.session_state:
