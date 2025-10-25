@@ -749,12 +749,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Set page config
-st.set_page_config(
-    page_title="TEDIWIRA",
-    page_icon="📓",
-    layout="wide"
-)
 
 
 
