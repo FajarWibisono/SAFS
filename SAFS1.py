@@ -732,3 +732,19 @@ if st.session_state.should_display_results and st.session_state.ratio_data and s
         st.session_state.evaluations,
         st.session_state.scores
     )
+# Sembunyikan tombol Fork & GitHub di Streamlit Cloud
+st.markdown(
+    """
+    <style>
+        /* Sembunyikan tombol Fork dan ikon GitHub */
+        .stApp [data-testid="stHeader"] {
+            display: none !important;
+        }
+        /* Jika ingin sembunyikan juga menu 3 titik (More options) */
+        .stApp [data-testid="stToolbar"] {
+            display: none !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
