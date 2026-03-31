@@ -37,29 +37,22 @@ for _key, _default in [
         st.session_state[_key] = _default
 
 # --- Stock Input ---
-st.subheader("Masukkan Kode Saham")
-col1, col2 = st.columns(2)
-with col1:
-    stock1 = st.text_input("Saham 1", "AUTO.JK")
-    stock3 = st.text_input("Saham 3", "TLKM.JK")
-    stock5 = st.text_input("Saham 5", "ASII.JK")
-    stock7 = st.text_input("Saham 7", "")
-with col2:
-    stock2 = st.text_input("Saham 2", "IPCC.JK")
-    stock4 = st.text_input("Saham 4", "UNVR.JK")
-    stock6 = st.text_input("Saham 6", "PALM.JK")
-
-
 def normalize_ticker(ticker: str) -> str:
-    """Normalize ticker to IDX format — auto-append .JK if missing."""
+    """Normalize ticker to IDX format — auto-append .JK if missing, case-insensitive."""
     t = ticker.strip().upper()
     if t and not t.endswith(".JK"):
         t += ".JK"
     return t
 
 
-# Normalize and collect non-empty tickers
-stocks = [normalize_ticker(s) for s in [stock1, stock2, stock3, stock4, stock5, stock6, stock7] if s.strip()]
+ticker_input = st.text_input(
+    "Masukkan Kode Saham (max. 7 saham, contoh: TLKM, ARNA, AUTO, ADRO, PTBA, ASII, ANTM)",
+    "TLKM, ARNA, AUTO, ADRO, PTBA, ASII, ANTM",
+)
+
+# Parse, normalize, deduplicate, and cap at 7
+_raw = [t for t in ticker_input.split(",") if t.strip()]
+stocks = list(dict.fromkeys(normalize_ticker(t) for t in _raw))[:7]
 
 
 # ─────────────────────────────────────────────
