@@ -60,14 +60,15 @@ stocks = list(dict.fromkeys(normalize_ticker(t) for t in _raw))[:7]
 # ─────────────────────────────────────────────
 
 def _get_field(df: pd.DataFrame, *field_names):
-    """Return the first matching row's latest value from a financial DataFrame.
-    Returns float or None. Tries all provided field_names before giving up."""
+    """Return the first matching row's latest non-null value from a financial DataFrame.
+    Scans all periods (columns) per field before giving up."""
     if df is None or df.empty:
         return None
     for name in field_names:
         if name in df.index:
-            val = df.loc[name].iloc[0]
-            return float(val) if pd.notna(val) else None
+            for val in df.loc[name]:
+                if pd.notna(val):
+                    return float(val)
     return None
 
 
@@ -83,23 +84,39 @@ def fetch_ticker_data(stock: str) -> dict:
             ticker = yf.Ticker(stock)
             info = ticker.info
 
-            # Resolve current price
-            current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+            # Resolve current price — try multiple sources
+            current_price = (
+                info.get("currentPrice")
+                or info.get("regularMarketPrice")
+                or info.get("previousClose")
+                or info.get("ask")
+                or info.get("bid")
+            )
             if current_price is None:
                 hist = ticker.history(period="5d")
-                if hist.empty:
-                    raise ValueError(f"Tidak ada data harga untuk {stock}")
-                current_price = float(hist["Close"].iloc[-1])
+                if not hist.empty:
+                    current_price = float(hist["Close"].dropna().iloc[-1])
+            if current_price is None:
+                raise ValueError(f"Tidak ada data harga untuk {stock}")
+
+            # Annual financial statements — fall back to quarterly if empty
+            fin = ticker.financials
+            if fin is None or fin.empty:
+                fin = ticker.quarterly_financials
+
+            bs = ticker.balance_sheet
+            if bs is None or bs.empty:
+                bs = ticker.quarterly_balance_sheet
 
             return {
                 "info": info,
-                "financials": ticker.financials,      # = ticker.income_stmt
-                "balance_sheet": ticker.balance_sheet,
+                "financials": fin,
+                "balance_sheet": bs,
                 "current_price": float(current_price),
             }
         except Exception as exc:
             if attempt < 2:
-                time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s
+                time.sleep(2 ** attempt)
             else:
                 raise RuntimeError(
                     f"Gagal mengambil data {stock} setelah 3 percobaan: {exc}"
@@ -123,10 +140,20 @@ def compute_ratios(data: dict) -> dict:
         "Total Stockholder Equity",
         "Common Stock Equity",
         "Total Equity Gross Minority Interest",
+        "Stockholders' Equity",
+        "Equity",
+        "Net Assets",
     )
 
     # ── ROE ──────────────────────────────────
-    net_income_roe = _get_field(fin, "Net Income", "Net Income Common Stockholders")
+    net_income_roe = _get_field(
+        fin,
+        "Net Income",
+        "Net Income Common Stockholders",
+        "Net Income Including Noncontrolling Interests",
+        "Net Income Applicable To Common Shares",
+        "Net Profit",
+    )
     if net_income_roe is not None and total_equity is not None and total_equity != 0:
         roe = (net_income_roe / total_equity) * 100
     else:
@@ -134,12 +161,24 @@ def compute_ratios(data: dict) -> dict:
         roe = (float(raw) * 100) if raw is not None else None
 
     # ── DER ──────────────────────────────────
-    total_debt = _get_field(bs, "Total Debt", "Long Term Debt And Capital Lease Obligation")
+    total_debt = _get_field(
+        bs,
+        "Total Debt",
+        "Long Term Debt And Capital Lease Obligation",
+        "Total Liabilities Net Minority Interest",
+        "Total Liabilities",
+    )
     if total_debt is None:
-        ltd = _get_field(bs, "Long Term Debt")
-        std = _get_field(bs, "Short Long Term Debt", "Current Debt", "Current Portion Of Long Term Debt")
-        if ltd is not None:
-            total_debt = ltd + (std or 0.0)
+        ltd = _get_field(bs, "Long Term Debt", "Long Term Debt And Capital Lease Obligation")
+        std = _get_field(
+            bs,
+            "Short Long Term Debt",
+            "Current Debt",
+            "Current Portion Of Long Term Debt",
+            "Current Debt And Capital Lease Obligation",
+        )
+        if ltd is not None or std is not None:
+            total_debt = (ltd or 0.0) + (std or 0.0)
     if total_debt is not None and total_equity is not None and total_equity != 0:
         der = total_debt / total_equity
     else:
@@ -159,7 +198,7 @@ def compute_ratios(data: dict) -> dict:
     ps_raw = info.get("priceToSalesTrailing12Months")
     if ps_raw is None:
         mktcap  = info.get("marketCap")
-        revenue = _get_field(fin, "Total Revenue")
+        revenue = _get_field(fin, "Total Revenue", "Operating Revenue", "Revenue")
         if mktcap is not None and revenue is not None and revenue != 0:
             ps_raw = mktcap / revenue
     ps = float(ps_raw) if ps_raw is not None else None
@@ -174,8 +213,8 @@ def compute_ratios(data: dict) -> dict:
     if om_raw is not None:
         op_margin = float(om_raw) * 100
     else:
-        op_income = _get_field(fin, "Operating Income", "EBIT")
-        revenue   = _get_field(fin, "Total Revenue")
+        op_income = _get_field(fin, "Operating Income", "EBIT", "Operating Profit")
+        revenue   = _get_field(fin, "Total Revenue", "Operating Revenue", "Revenue")
         op_margin = ((op_income / revenue) * 100
                      if op_income is not None and revenue is not None and revenue != 0
                      else None)
@@ -186,13 +225,19 @@ def compute_ratios(data: dict) -> dict:
         gpm = float(gpm_raw) * 100
     else:
         gross_profit = _get_field(fin, "Gross Profit")
-        revenue      = _get_field(fin, "Total Revenue")
+        revenue      = _get_field(fin, "Total Revenue", "Operating Revenue", "Revenue")
         gpm = ((gross_profit / revenue) * 100
                if gross_profit is not None and revenue is not None and revenue != 0
                else None)
 
     # ── ROA — independent net_income fetch (not shared with ROE) ──
-    net_income_roa = _get_field(fin, "Net Income", "Net Income Common Stockholders")
+    net_income_roa = _get_field(
+        fin,
+        "Net Income",
+        "Net Income Common Stockholders",
+        "Net Income Including Noncontrolling Interests",
+        "Net Profit",
+    )
     total_assets   = _get_field(bs, "Total Assets")
     if net_income_roa is not None and total_assets is not None and total_assets != 0:
         roa = (net_income_roa / total_assets) * 100
@@ -204,8 +249,8 @@ def compute_ratios(data: dict) -> dict:
     ey = ((1 / pe) * 100) if (pe is not None and pe > 0) else None
 
     # ── Current Ratio ─────────────────────────
-    cur_assets = _get_field(bs, "Current Assets")
-    cur_liab   = _get_field(bs, "Current Liabilities")
+    cur_assets = _get_field(bs, "Current Assets", "Total Current Assets")
+    cur_liab   = _get_field(bs, "Current Liabilities", "Total Current Liabilities")
     if cur_assets is not None and cur_liab is not None and cur_liab != 0:
         current_ratio = cur_assets / cur_liab
     else:
@@ -237,6 +282,48 @@ def compute_ratios(data: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
+# Compute Target Price with multiple fallbacks
+# ─────────────────────────────────────────────
+
+def compute_target_price(info: dict, ratios: dict, current_price: float) -> float | None:
+    """Estimate target price using analyst data first, then calculated fallbacks."""
+    # 1. Analyst consensus mean
+    target = info.get("targetMeanPrice")
+    if target is not None:
+        return float(target)
+
+    # 2. Average of analyst high/low
+    high = info.get("targetHighPrice")
+    low  = info.get("targetLowPrice")
+    if high is not None and low is not None:
+        return float((high + low) / 2)
+
+    # 3. Analyst median
+    median = info.get("targetMedianPrice")
+    if median is not None:
+        return float(median)
+
+    # 4. EPS × fair P/E (capped at 25x to avoid extreme values)
+    eps = info.get("forwardEps") or info.get("trailingEps")
+    if eps is not None and eps > 0:
+        pe = ratios.get("P/E")
+        if pe is not None and pe > 0:
+            fair_pe = min(pe, 25.0)
+        else:
+            fair_pe = 15.0
+        return float(eps * fair_pe)
+
+    # 5. PBV-based: BV per share × fair P/B (1.5x)
+    bvps = info.get("bookValue")
+    if bvps is not None and bvps > 0:
+        pb = ratios.get("P/B")
+        fair_pb = min(pb, 3.0) if (pb is not None and pb > 0) else 1.5
+        return float(bvps * fair_pb)
+
+    return None
+
+
+# ─────────────────────────────────────────────
 # Orchestrate: parallel fetch + compute for all stocks
 # ─────────────────────────────────────────────
 
@@ -251,14 +338,10 @@ def get_ratio_data(stocks: list) -> dict:
             data   = fetch_ticker_data(stock)
             ratios = compute_ratios(data)
             info   = data["info"]
-            return (
-                stock,
-                ratios,
-                data["current_price"],
-                info.get("targetMeanPrice"),
-                info.get("forwardEps") or info.get("trailingEps"),
-                None,
-            )
+            price  = data["current_price"]
+            target = compute_target_price(info, ratios, price)
+            eps    = info.get("forwardEps") or info.get("trailingEps")
+            return stock, ratios, price, target, eps, None
         except Exception as exc:
             return stock, None, None, None, None, str(exc)
 
