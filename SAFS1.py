@@ -1,304 +1,301 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import datetime as dt
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Set page title and configuration
+# --- Constants ---
+RATIO_KEYS = [
+    "ROE", "DER", "P/E", "P/B", "P/S",
+    "Dividend Yield", "Operating Margin", "GPM", "ROA",
+    "Earnings Yield", "Current Ratio", "PEG Ratio",
+]
+
+# --- Page Config ---
 st.set_page_config(page_title="🔍 SAFS", layout="wide")
-
-# App title and description
 st.title("📊 Screening Awal Fundamental Saham")
-st.markdown("Aplikasi ini membantu Anda untuk menganalisa dan membandingkan Saham yang menarik perhatian  Anda untuk investasi. **APLIKASI TIDAK BERLAKU UNTUK EMITEN perBANKan.** Aplikasi ini secara otomatis akan membandingkan berbagai RATIO FUNDAMENTAL dari **maksimal 7 saham** yang Anda masukkan, dan Memilih 3 yang terbaik diantara lainnya. **Happy Cuan!!!**")
+st.markdown(
+    "Aplikasi ini membantu Anda untuk menganalisa dan membandingkan Saham yang menarik perhatian "
+    "Anda untuk investasi. **APLIKASI TIDAK BERLAKU UNTUK EMITEN perBANKan.** Aplikasi ini secara "
+    "otomatis akan membandingkan berbagai RATIO FUNDAMENTAL dari **maksimal 7 saham** yang Anda "
+    "masukkan, dan Memilih 3 yang terbaik diantara lainnya. **Happy Cuan!!!**"
+)
 
-# Initialize flag for tracking if we need to display results
-if 'should_display_results' not in st.session_state:
-    st.session_state.should_display_results = False
+# --- Session State Init ---
+for _key, _default in [
+    ('should_display_results', False),
+    ('manual_values', {}),
+    ('ratio_data', {}),
+    ('evaluations', {}),
+    ('scores', {}),
+    ('stock_prices', {}),
+    ('target_prices', {}),
+    ('estimated_eps', {}),
+]:
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
 
-# Input for stock tickers
+# --- Stock Input ---
 st.subheader("Masukkan Kode Saham")
 col1, col2 = st.columns(2)
-
 with col1:
     stock1 = st.text_input("Saham 1", "AUTO.JK")
     stock3 = st.text_input("Saham 3", "TLKM.JK")
     stock5 = st.text_input("Saham 5", "ASII.JK")
     stock7 = st.text_input("Saham 7", "")
-
 with col2:
     stock2 = st.text_input("Saham 2", "IPCC.JK")
     stock4 = st.text_input("Saham 4", "UNVR.JK")
     stock6 = st.text_input("Saham 6", "PALM.JK")
 
-# Collect all stocks in a list
-stocks = [stock for stock in [stock1, stock2, stock3, stock4, stock5, stock6, stock7] if stock]
 
-# Initialize session state for manual inputs and analysis results
-if 'manual_values' not in st.session_state:
-    st.session_state.manual_values = {}
+def normalize_ticker(ticker: str) -> str:
+    """Normalize ticker to IDX format — auto-append .JK if missing."""
+    t = ticker.strip().upper()
+    if t and not t.endswith(".JK"):
+        t += ".JK"
+    return t
 
-if 'ratio_data' not in st.session_state:
-    st.session_state.ratio_data = {}
 
-if 'evaluations' not in st.session_state:
-    st.session_state.evaluations = {}
+# Normalize and collect non-empty tickers
+stocks = [normalize_ticker(s) for s in [stock1, stock2, stock3, stock4, stock5, stock6, stock7] if s.strip()]
 
-if 'scores' not in st.session_state:
-    st.session_state.scores = {}
 
-if 'stock_prices' not in st.session_state:
-    st.session_state.stock_prices = {}
+# ─────────────────────────────────────────────
+# Helper: safe field lookup with multiple name variants
+# ─────────────────────────────────────────────
 
-if 'target_prices' not in st.session_state:
-    st.session_state.target_prices = {}
+def _get_field(df: pd.DataFrame, *field_names):
+    """Return the first matching row's latest value from a financial DataFrame.
+    Returns float or None. Tries all provided field_names before giving up."""
+    if df is None or df.empty:
+        return None
+    for name in field_names:
+        if name in df.index:
+            val = df.loc[name].iloc[0]
+            return float(val) if pd.notna(val) else None
+    return None
 
-if 'estimated_eps' not in st.session_state:
-    st.session_state.estimated_eps = {}
 
-# Function to get ratio data
-def get_ratio_data(stocks):
+# ─────────────────────────────────────────────
+# Fetch: cached per ticker (1 hour TTL)
+# ─────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ticker_data(stock: str) -> dict:
+    """Fetch raw yfinance data for one IDX stock. Results cached for 1 hour."""
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker(stock)
+            info = ticker.info
+
+            # Resolve current price
+            current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+            if current_price is None:
+                hist = ticker.history(period="5d")
+                if hist.empty:
+                    raise ValueError(f"Tidak ada data harga untuk {stock}")
+                current_price = float(hist["Close"].iloc[-1])
+
+            return {
+                "info": info,
+                "financials": ticker.financials,      # = ticker.income_stmt
+                "balance_sheet": ticker.balance_sheet,
+                "current_price": float(current_price),
+            }
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s
+            else:
+                raise RuntimeError(
+                    f"Gagal mengambil data {stock} setelah 3 percobaan: {exc}"
+                ) from exc
+
+
+# ─────────────────────────────────────────────
+# Compute: all fundamental ratios from raw data
+# ─────────────────────────────────────────────
+
+def compute_ratios(data: dict) -> dict:
+    """Derive all fundamental ratios from fetched ticker data."""
+    info = data["info"]
+    fin  = data["financials"]
+    bs   = data["balance_sheet"]
+
+    # Shared equity (used by ROE and DER)
+    total_equity = _get_field(
+        bs,
+        "Stockholders Equity",
+        "Total Stockholder Equity",
+        "Common Stock Equity",
+        "Total Equity Gross Minority Interest",
+    )
+
+    # ── ROE ──────────────────────────────────
+    net_income_roe = _get_field(fin, "Net Income", "Net Income Common Stockholders")
+    if net_income_roe is not None and total_equity is not None and total_equity != 0:
+        roe = (net_income_roe / total_equity) * 100
+    else:
+        raw = info.get("returnOnEquity")
+        roe = (float(raw) * 100) if raw is not None else None
+
+    # ── DER ──────────────────────────────────
+    total_debt = _get_field(bs, "Total Debt", "Long Term Debt And Capital Lease Obligation")
+    if total_debt is None:
+        ltd = _get_field(bs, "Long Term Debt")
+        std = _get_field(bs, "Short Long Term Debt", "Current Debt", "Current Portion Of Long Term Debt")
+        if ltd is not None:
+            total_debt = ltd + (std or 0.0)
+    if total_debt is not None and total_equity is not None and total_equity != 0:
+        der = total_debt / total_equity
+    else:
+        raw = info.get("debtToEquity")
+        # yfinance returns debtToEquity as percentage (e.g. 150 = 1.5x ratio)
+        der = (float(raw) / 100) if raw is not None else None
+
+    # ── P/E ──────────────────────────────────
+    pe_raw = info.get("trailingPE") or info.get("forwardPE")
+    pe = float(pe_raw) if pe_raw is not None else None
+
+    # ── P/B ──────────────────────────────────
+    pb_raw = info.get("priceToBook")
+    pb = float(pb_raw) if pb_raw is not None else None
+
+    # ── P/S ──────────────────────────────────
+    ps_raw = info.get("priceToSalesTrailing12Months")
+    if ps_raw is None:
+        mktcap  = info.get("marketCap")
+        revenue = _get_field(fin, "Total Revenue")
+        if mktcap is not None and revenue is not None and revenue != 0:
+            ps_raw = mktcap / revenue
+    ps = float(ps_raw) if ps_raw is not None else None
+
+    # ── Dividend Yield — stored as % (e.g. 3.5 means 3.5%) ──
+    div_raw = info.get("dividendYield")
+    # yfinance returns dividendYield as a decimal (0.035 = 3.5%)
+    div = (float(div_raw) * 100) if div_raw is not None else None
+
+    # ── Operating Margin ──────────────────────
+    om_raw = info.get("operatingMargins")
+    if om_raw is not None:
+        op_margin = float(om_raw) * 100
+    else:
+        op_income = _get_field(fin, "Operating Income", "EBIT")
+        revenue   = _get_field(fin, "Total Revenue")
+        op_margin = ((op_income / revenue) * 100
+                     if op_income is not None and revenue is not None and revenue != 0
+                     else None)
+
+    # ── GPM ──────────────────────────────────
+    gpm_raw = info.get("grossMargins")
+    if gpm_raw is not None:
+        gpm = float(gpm_raw) * 100
+    else:
+        gross_profit = _get_field(fin, "Gross Profit")
+        revenue      = _get_field(fin, "Total Revenue")
+        gpm = ((gross_profit / revenue) * 100
+               if gross_profit is not None and revenue is not None and revenue != 0
+               else None)
+
+    # ── ROA — independent net_income fetch (not shared with ROE) ──
+    net_income_roa = _get_field(fin, "Net Income", "Net Income Common Stockholders")
+    total_assets   = _get_field(bs, "Total Assets")
+    if net_income_roa is not None and total_assets is not None and total_assets != 0:
+        roa = (net_income_roa / total_assets) * 100
+    else:
+        raw = info.get("returnOnAssets")
+        roa = (float(raw) * 100) if raw is not None else None
+
+    # ── Earnings Yield — derived from P/E ────
+    ey = ((1 / pe) * 100) if (pe is not None and pe > 0) else None
+
+    # ── Current Ratio ─────────────────────────
+    cur_assets = _get_field(bs, "Current Assets")
+    cur_liab   = _get_field(bs, "Current Liabilities")
+    if cur_assets is not None and cur_liab is not None and cur_liab != 0:
+        current_ratio = cur_assets / cur_liab
+    else:
+        raw = info.get("currentRatio")
+        current_ratio = float(raw) if raw is not None else None
+
+    # ── PEG Ratio ─────────────────────────────
+    peg_raw = info.get("pegRatio")
+    if peg_raw is None and pe is not None:
+        growth = info.get("earningsGrowth")
+        if growth is not None and growth != 0:
+            peg_raw = pe / (growth * 100)
+    peg = float(peg_raw) if peg_raw is not None else None
+
+    return {
+        "ROE": roe,
+        "DER": der,
+        "P/E": pe,
+        "P/B": pb,
+        "P/S": ps,
+        "Dividend Yield": div,
+        "Operating Margin": op_margin,
+        "GPM": gpm,
+        "ROA": roa,
+        "Earnings Yield": ey,
+        "Current Ratio": current_ratio,
+        "PEG Ratio": peg,
+    }
+
+
+# ─────────────────────────────────────────────
+# Orchestrate: parallel fetch + compute for all stocks
+# ─────────────────────────────────────────────
+
+def get_ratio_data(stocks: list) -> dict:
     results = {}
     prices = {}
     target_prices = {}
     estimated_eps_values = {}
 
-    for stock in stocks:
+    def process_stock(stock: str):
         try:
-            # Get stock data with retry mechanism
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    ticker = yf.Ticker(stock)
-                    info = ticker.info
+            data   = fetch_ticker_data(stock)
+            ratios = compute_ratios(data)
+            info   = data["info"]
+            return (
+                stock,
+                ratios,
+                data["current_price"],
+                info.get("targetMeanPrice"),
+                info.get("forwardEps") or info.get("trailingEps"),
+                None,
+            )
+        except Exception as exc:
+            return stock, None, None, None, None, str(exc)
 
-                    # Get current price
-                    current_price = info.get('currentPrice', None)
-                    if current_price is None:
-                        # Try alternative methods to get price
-                        hist = ticker.history(period="1d")
-                        if not hist.empty and 'Close' in hist.columns:
-                            current_price = hist['Close'].iloc[-1]
+    with ThreadPoolExecutor(max_workers=min(4, len(stocks))) as executor:
+        futures = {executor.submit(process_stock, s): s for s in stocks}
+        for future in as_completed(futures):
+            stock, ratios, price, target, eps, error = future.result()
+            if error:
+                st.warning(f"⚠️ Gagal mengambil data **{stock}**: {error}")
+                results[stock] = {k: None for k in RATIO_KEYS}
+                prices[stock] = None
+                target_prices[stock] = None
+                estimated_eps_values[stock] = None
+            else:
+                results[stock] = ratios
+                prices[stock] = price
+                target_prices[stock] = target
+                estimated_eps_values[stock] = eps
 
-                    prices[stock] = current_price
-
-                    # Get target price
-                    target_mean_price = info.get('targetMeanPrice', None)
-                    target_prices[stock] = target_mean_price
-
-                    # Get estimated EPS
-                    estimated_eps = info.get('forwardEps', None)
-                    if estimated_eps is None:
-                        estimated_eps = info.get('trailingEps', None)  # Fallback to trailing if forward not available
-                    estimated_eps_values[stock] = estimated_eps
-
-                    # Get financial data with longer timeframe
-                    financials = ticker.financials
-                    balance_sheet = ticker.balance_sheet
-                    income_stmt = ticker.income_stmt if hasattr(ticker, 'income_stmt') else ticker.financials
-                    cash_flow = ticker.cashflow
-
-                    # If we got here, we succeeded
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        time.sleep(1)  # Wait before retrying
-                        continue
-                    else:
-                        raise e
-
-            # ROE (Return on Equity)
-            try:
-                net_income = financials.loc['Net Income'].iloc[0]
-                total_equity = balance_sheet.loc['Total Stockholder Equity'].iloc[0]
-                roe = (net_income / total_equity) * 100
-            except:
-                try:
-                    # Alternative method
-                    roe = info.get('returnOnEquity', None)
-                    if roe:
-                        roe = roe * 100
-                except:
-                    roe = None
-
-            # D/E Ratio (Debt to Equity)
-            try:
-                if 'Total Debt' in balance_sheet.index:
-                    total_debt = balance_sheet.loc['Total Debt'].iloc[0]
-                elif 'Long Term Debt' in balance_sheet.index:
-                    if 'Short Long Term Debt' in balance_sheet.index:
-                        total_debt = balance_sheet.loc['Long Term Debt'].iloc[0] + balance_sheet.loc['Short Long Term Debt'].iloc[0]
-                    else:
-                        total_debt = balance_sheet.loc['Long Term Debt'].iloc[0]
-                else:
-                    total_debt = None
-
-                if total_debt and total_equity:
-                    de_ratio = total_debt / total_equity
-                else:
-                    de_ratio = None
-            except:
-                try:
-                    # Alternative method
-                    de_ratio = info.get('debtToEquity', None)
-                    if de_ratio:
-                        de_ratio = de_ratio / 100  # Convert from percentage
-                except:
-                    de_ratio = None
-
-            # P/E Ratio (Price to Earnings)
-            try:
-                pe_ratio = info.get('trailingPE', None)
-                if not pe_ratio:
-                    pe_ratio = info.get('forwardPE', None)
-            except:
-                pe_ratio = None
-
-            # P/B Ratio (Price to Book)
-            try:
-                pb_ratio = info.get('priceToBook', None)
-            except:
-                pb_ratio = None
-
-            # P/S Ratio (Price to Sales)
-            try:
-                ps_ratio = info.get('priceToSalesTrailing12Months', None)
-                if not ps_ratio:
-                    # Calculate manually
-                    market_cap = info.get('marketCap', None)
-                    revenue = financials.loc['Total Revenue'].iloc[0] if 'Total Revenue' in financials.index else None
-                    if market_cap and revenue and revenue != 0:
-                        ps_ratio = market_cap / revenue
-            except:
-                ps_ratio = None
-
-            # Dividend Yield
-            try:
-                div_yield = info.get('dividendYield', 0)
-                # Yahoo Finance returns dividend yield as a decimal (e.g., 0.03 for 3%)
-            except:
-                div_yield = None
-
-            # Operating Margin
-            try:
-                op_margin = info.get('operatingMargins', None)
-                if op_margin:
-                    op_margin = op_margin * 100
-                else:
-                    # Calculate from financial statements
-                    if 'Operating Income' in income_stmt.index and 'Total Revenue' in income_stmt.index:
-                        op_income = income_stmt.loc['Operating Income'].iloc[0]
-                        revenue = income_stmt.loc['Total Revenue'].iloc[0]
-                        if revenue != 0:
-                            op_margin = (op_income / revenue) * 100
-            except:
-                op_margin = None
-
-            # Gross Profit Margin (GPM)
-            try:
-                gpm = info.get('grossMargins', None)
-                if gpm:
-                    gpm = gpm * 100
-                else:
-                    # Calculate from financial statements
-                    if 'Gross Profit' in income_stmt.index and 'Total Revenue' in income_stmt.index:
-                        gross_profit = income_stmt.loc['Gross Profit'].iloc[0]
-                        revenue = income_stmt.loc['Total Revenue'].iloc[0]
-                        if revenue != 0:
-                            gpm = (gross_profit / revenue) * 100
-            except:
-                gpm = None
-
-            # ROA (Return on Assets)
-            try:
-                total_assets = balance_sheet.loc['Total Assets'].iloc[0]
-                if net_income and total_assets:
-                    roa = (net_income / total_assets) * 100
-                else:
-                    roa = info.get('returnOnAssets', None)
-                    if roa:
-                        roa = roa * 100
-            except:
-                roa = None
-
-            # Earnings Yield
-            try:
-                if pe_ratio and pe_ratio > 0:
-                    earnings_yield = (1 / pe_ratio) * 100
-                else:
-                    earnings_yield = None
-            except:
-                earnings_yield = None
-
-            # Current Ratio - NEW
-            try:
-                if 'Current Assets' in balance_sheet.index and 'Current Liabilities' in balance_sheet.index:
-                    current_assets = balance_sheet.loc['Current Assets'].iloc[0]
-                    current_liabilities = balance_sheet.loc['Current Liabilities'].iloc[0]
-                    if current_liabilities != 0:
-                        current_ratio = current_assets / current_liabilities
-                    else:
-                        current_ratio = None
-                else:
-                    current_ratio = None
-            except:
-                current_ratio = None
-
-            # PEG Ratio - NEW
-            try:
-                peg_ratio = info.get('pegRatio', None)
-                if not peg_ratio:
-                    # Try to calculate if we have PE and growth rate
-                    growth_rate = info.get('earningsGrowth', None)
-                    if pe_ratio and growth_rate and growth_rate != 0:
-                        peg_ratio = pe_ratio / (growth_rate * 100)
-            except:
-                peg_ratio = None
-
-            # Store results
-            results[stock] = {
-                "ROE": roe,
-                "DER": de_ratio,
-                "P/E": pe_ratio,
-                "P/B": pb_ratio,
-                "P/S": ps_ratio,
-                "Dividend Yield": div_yield,
-                "Operating Margin": op_margin,
-                "GPM": gpm,
-                "ROA": roa,
-                "Earnings Yield": earnings_yield,
-                "Current Ratio": current_ratio,  # NEW
-                "PEG Ratio": peg_ratio  # NEW
-            }
-
-        except Exception as e:
-            st.error(f"Error analyzing {stock}: {str(e)}")
-            results[stock] = {
-                "ROE": None,
-                "DER": None,
-                "P/E": None,
-                "P/B": None,
-                "P/S": None,
-                "Dividend Yield": None,
-                "Operating Margin": None,
-                "GPM": None,
-                "ROA": None,
-                "Earnings Yield": None,
-                "Current Ratio": None,  # NEW
-                "PEG Ratio": None  # NEW
-            }
-            prices[stock] = None
-            target_prices[stock] = None
-            estimated_eps_values[stock] = None
-
-    # Store values in session state
     st.session_state.stock_prices = prices
     st.session_state.target_prices = target_prices
     st.session_state.estimated_eps = estimated_eps_values
     return results
 
-# Function to evaluate ratios
-def evaluate_ratios(ratio_data):
+
+# ─────────────────────────────────────────────
+# Evaluate ratios and produce scores
+# ─────────────────────────────────────────────
+
+def evaluate_ratios(ratio_data: dict) -> tuple:
     evaluations = {}
     scores = {}
 
@@ -307,448 +304,206 @@ def evaluate_ratios(ratio_data):
         scores[stock] = 0
         good_count = 0
 
-        # Check if we have manual values for this stock
+        # Apply manual overrides
         if stock in st.session_state.manual_values:
             for ratio, value in st.session_state.manual_values[stock].items():
                 if value != "":
                     try:
                         ratios[ratio] = float(value)
-                    except:
+                    except ValueError:
                         pass
 
-        # ROE
-        roe = ratios["ROE"]
-        if roe is not None:
-            if roe > 15:
-                evaluations[stock]["ROE"] = "Baik"
+        def grade(key, good_fn, mid_fn):
+            """Helper: grade one ratio and update score."""
+            val = ratios.get(key)
+            if val is None:
+                evaluations[stock][key] = "N/A"
+                return
+            if good_fn(val):
+                evaluations[stock][key] = "Baik"
                 scores[stock] += 2
+                nonlocal good_count
                 good_count += 1
-            elif 5 <= roe <= 15:
-                evaluations[stock]["ROE"] = "Biasa"
+            elif mid_fn(val):
+                evaluations[stock][key] = "Biasa"
                 scores[stock] += 1
             else:
-                evaluations[stock]["ROE"] = "Buruk"
-        else:
-            evaluations[stock]["ROE"] = "N/A"
+                evaluations[stock][key] = "Buruk"
 
-        # DER
-        de = ratios["DER"]
-        if de is not None:
-            if de < 0.8:
-                evaluations[stock]["DER"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 0.8 <= de <= 1:
-                evaluations[stock]["DER"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["DER"] = "Buruk"
-        else:
-            evaluations[stock]["DER"] = "N/A"
-
-        # P/E
-        pe = ratios["P/E"]
-        if pe is not None:
-            if pe < 15:
-                evaluations[stock]["P/E"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 15 <= pe <= 25:
-                evaluations[stock]["P/E"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["P/E"] = "Buruk"
-        else:
-            evaluations[stock]["P/E"] = "N/A"
-
-        # P/B
-        pb = ratios["P/B"]
-        if pb is not None:
-            if pb < 1.5:
-                evaluations[stock]["P/B"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 1.5 <= pb <= 3:
-                evaluations[stock]["P/B"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["P/B"] = "Buruk"
-        else:
-            evaluations[stock]["P/B"] = "N/A"
-
-        # P/S
-        ps = ratios["P/S"]
-        if ps is not None:
-            if 0 < ps < 1:
-                evaluations[stock]["P/S"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 1 <= ps <= 2:
-                evaluations[stock]["P/S"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["P/S"] = "Buruk"
-        else:
-            evaluations[stock]["P/S"] = "N/A"
-
-        # Dividend Yield - Updated criteria
-        div = ratios["Dividend Yield"]
-        if div is not None:
-            # Ensure dividend yield is in percentage format (0-100)
-            if div > 1 and div <= 100:  # If it's already in percentage format (1-100)
-                div_pct = div
-            elif div > 0 and div <= 1:  # If it's in decimal format (0-1)
-                div_pct = div * 100
-            else:
-                div_pct = div  # Keep as is if it's an unusual value
-
-            if div_pct > 3.75:
-                evaluations[stock]["Dividend Yield"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 1 <= div_pct <= 3.75:
-                evaluations[stock]["Dividend Yield"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["Dividend Yield"] = "Buruk"
-        else:
-            evaluations[stock]["Dividend Yield"] = "N/A"
-
-        # Operating Margin
-        om = ratios["Operating Margin"]
-        if om is not None:
-            if om > 20:
-                evaluations[stock]["Operating Margin"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 10 <= om <= 20:
-                evaluations[stock]["Operating Margin"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["Operating Margin"] = "Buruk"
-        else:
-            evaluations[stock]["Operating Margin"] = "N/A"
-
-        # GPM
-        gpm = ratios["GPM"]
-        if gpm is not None:
-            if gpm > 40:
-                evaluations[stock]["GPM"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 20 <= gpm <= 40:
-                evaluations[stock]["GPM"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["GPM"] = "Buruk"
-        else:
-            evaluations[stock]["GPM"] = "N/A"
-
-        # ROA
-        roa = ratios["ROA"]
-        if roa is not None:
-            if roa > 5:
-                evaluations[stock]["ROA"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 2 <= roa <= 5:
-                evaluations[stock]["ROA"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["ROA"] = "Buruk"
-        else:
-            evaluations[stock]["ROA"] = "N/A"
-
-        # Earnings Yield
-        ey = ratios["Earnings Yield"]
-        if ey is not None:
-            if ey > 10:
-                evaluations[stock]["Earnings Yield"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 5 <= ey <= 10:
-                evaluations[stock]["Earnings Yield"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["Earnings Yield"] = "Buruk"
-        else:
-            evaluations[stock]["Earnings Yield"] = "N/A"
-
-        # Current Ratio - NEW
-        cr = ratios["Current Ratio"]
-        if cr is not None:
-            if cr > 2:
-                evaluations[stock]["Current Ratio"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif 1 <= cr <= 2:
-                evaluations[stock]["Current Ratio"] = "Biasa"
-                scores[stock] += 1
-            else:
-                evaluations[stock]["Current Ratio"] = "Buruk"
-        else:
-            evaluations[stock]["Current Ratio"] = "N/A"
-
-        # PEG Ratio - NEW with UPDATED criteria
-        peg = ratios["PEG Ratio"]
-        if peg is not None:
-            if peg > 0 and peg < 1:  # Changed: Positive and less than 1
-                evaluations[stock]["PEG Ratio"] = "Baik"
-                scores[stock] += 2
-                good_count += 1
-            elif peg == 1 or (0.9 <= peg <= 1.1):  # Approximately 1
-                evaluations[stock]["PEG Ratio"] = "Biasa"
-                scores[stock] += 1
-            else:  # Greater than 1 or negative
-                evaluations[stock]["PEG Ratio"] = "Buruk"
-        else:
-            evaluations[stock]["PEG Ratio"] = "N/A"
+        grade("ROE",             lambda v: v > 15,          lambda v: 5 <= v <= 15)
+        grade("DER",             lambda v: v < 0.8,         lambda v: 0.8 <= v <= 1)
+        grade("P/E",             lambda v: v < 15,          lambda v: 15 <= v <= 25)
+        grade("P/B",             lambda v: v < 1.5,         lambda v: 1.5 <= v <= 3)
+        grade("P/S",             lambda v: 0 < v < 1,       lambda v: 1 <= v <= 2)
+        # Dividend Yield already stored as % (e.g. 3.5 = 3.5%)
+        grade("Dividend Yield",  lambda v: v > 3.75,        lambda v: 1 <= v <= 3.75)
+        grade("Operating Margin",lambda v: v > 20,          lambda v: 10 <= v <= 20)
+        grade("GPM",             lambda v: v > 40,          lambda v: 20 <= v <= 40)
+        grade("ROA",             lambda v: v > 5,           lambda v: 2 <= v <= 5)
+        grade("Earnings Yield",  lambda v: v > 10,          lambda v: 5 <= v <= 10)
+        grade("Current Ratio",   lambda v: v > 2,           lambda v: 1 <= v <= 2)
+        grade("PEG Ratio",       lambda v: 0 < v < 1,       lambda v: 0.9 <= v <= 1.1)
 
     return evaluations, scores
 
-# Function to display results in the new format
-def display_results(ratio_data, evaluations, scores):
-    # Create a comprehensive table with the new format
-    ratios = [
-        "ROE",
-        "DER",
-        "P/E",
-        "P/B",
-        "P/S",
-        "Dividend Yield",
-        "Operating Margin",
-        "GPM",
-        "ROA",
-        "Earnings Yield",
-        "Current Ratio",  
-        "PEG Ratio" 
-    ]
 
-    # Prepare data for the DataFrame
+# ─────────────────────────────────────────────
+# Display results
+# ─────────────────────────────────────────────
+
+def display_results(stocks: list, ratio_data: dict, evaluations: dict, scores: dict):
+    # ── Build DataFrame ──────────────────────
     data = []
     for stock in stocks:
-        if stock in ratio_data:
-            row_data = []
+        if stock not in ratio_data:
+            continue
+        row = [stock]
 
-            # First column is the stock ticker
-            row_data.append(stock)
+        price = st.session_state.stock_prices.get(stock)
+        row.append(f"{price:.2f}" if price is not None else "N/A")
 
-            # Second column is price
-            price = st.session_state.stock_prices.get(stock, None)
-            if price is not None:
-                row_data.append(f"{price:.2f}")
-            else:
-                row_data.append("N/A")
+        for ratio in RATIO_KEYS:
+            value    = ratio_data[stock].get(ratio)
+            penilaian = evaluations[stock].get(ratio, "N/A") if stock in evaluations else "N/A"
 
-            # Add ratio data
-            for ratio in ratios:
-                value = ratio_data[stock][ratio]
-                if isinstance(value, float):
-                    if ratio == "Dividend Yield":
-                        # Handle dividend yield specially
-                        if value > 1 and value <= 100:
-                            formatted_value = f"{value:.2f}%"
-                        elif value > 0 and value <= 1:
-                            formatted_value = f"{value * 100:.2f}%"
-                        else:
-                            formatted_value = f"{value:.2f}%"
-                    elif ratio in ["DER", "P/E", "P/B", "P/S", "Current Ratio", "PEG Ratio"]:
-                        formatted_value = f"{value:.2f}"
-                    else:
-                        formatted_value = f"{value:.2f}%"
+            if isinstance(value, float):
+                if ratio in ("DER", "P/E", "P/B", "P/S", "Current Ratio", "PEG Ratio"):
+                    fmt = f"{value:.2f}"
                 else:
-                    formatted_value = "N/A"
-
-                penilaian = evaluations[stock][ratio] if stock in evaluations else "N/A"
-                row_data.extend([formatted_value, penilaian])
-
-            # Add Estimated EPS after PEG Ratio
-            estimated_eps = st.session_state.estimated_eps.get(stock, None)
-            if estimated_eps is not None:
-                row_data.append(f"{estimated_eps:.2f}")
+                    # ROE, Operating Margin, GPM, ROA, Earnings Yield, Dividend Yield — all in %
+                    fmt = f"{value:.2f}%"
             else:
-                row_data.append("N/A")
+                fmt = "N/A"
 
-            # Add target price as the last column
-            target_price = st.session_state.target_prices.get(stock, None)
-            if target_price is not None:
-                row_data.append(f"{target_price:.2f}")
-            else:
-                row_data.append("N/A")
+            row.extend([fmt, penilaian])
 
-            data.append(row_data)
+        eps = st.session_state.estimated_eps.get(stock)
+        row.append(f"{eps:.2f}" if eps is not None else "N/A")
 
-    # Create column headers
-    # First level: SAHAM, PRICE, ratio names, est.EPS, and TARGET PRICE
-    # Second level: Empty for SAHAM/PRICE/est.EPS/TARGET PRICE, "Value" and "Penilaian" for ratios
-    header_level_1 = ['SAHAM', 'PRICE']
-    header_level_2 = ['', '']
+        target = st.session_state.target_prices.get(stock)
+        row.append(f"{target:.2f}" if target is not None else "N/A")
 
-    for ratio in ratios:
-        header_level_1.extend([ratio, ratio])
-        header_level_2.extend(['Value', 'Penilaian'])
+        data.append(row)
 
-    # Add est.EPS after PEG Ratio
-    header_level_1.append('est.EPS')
-    header_level_2.append('')
+    # ── Build MultiIndex columns ─────────────
+    h1 = ["SAHAM", "PRICE"]
+    h2 = ["", ""]
+    for ratio in RATIO_KEYS:
+        h1.extend([ratio, ratio])
+        h2.extend(["Value", "Penilaian"])
+    h1 += ["est.EPS", "TARGET PRICE"]
+    h2 += ["", ""]
 
-    # Add TARGET PRICE at the end
-    header_level_1.append('TARGET PRICE')
-    header_level_2.append('')
+    df = pd.DataFrame(data, columns=pd.MultiIndex.from_tuples(list(zip(h1, h2))))
 
-    # Create multi-index columns
-    column_tuples = list(zip(header_level_1, header_level_2))
-    multi_index = pd.MultiIndex.from_tuples(column_tuples)
-
-    # Create DataFrame with multi-index columns
-    df = pd.DataFrame(data, columns=multi_index)
-
-    # Display the table
     st.subheader("Analisis Fundamental")
     st.dataframe(df, use_container_width=True)
 
-    # Allow manual input for N/A values
+    # ── Manual Input Section ─────────────────
     st.subheader("Input Manual untuk Nilai N/A")
 
-    # Initialize manual values for each stock if not already done
     for stock in stocks:
         if stock not in st.session_state.manual_values:
-            st.session_state.manual_values[stock] = {ratio: "" for ratio in ratios}
+            st.session_state.manual_values[stock] = {r: "" for r in RATIO_KEYS}
 
-    # Create tabs for each stock
     tabs = st.tabs(stocks)
     for i, stock in enumerate(stocks):
         with tabs[i]:
             st.write(f"Input nilai manual untuk {stock}:")
-
-            # Create columns for inputs without using forms
             cols = st.columns(3)
+            has_na = False
 
-            # Track if we have any N/A values to show
-            has_na_values = False
-
-            for j, ratio in enumerate(ratios):
-                col_idx = j % 3
-                with cols[col_idx]:
-                    current_value = ratio_data[stock][ratio]
-
-                    # Always show input fields for all ratios
-                    current_input = st.session_state.manual_values[stock].get(ratio, "")
-
-                    # Show the current value (if any)
-                    if current_value is not None and isinstance(current_value, float):
-                        if ratio == "Dividend Yield" and current_value <= 1:
-                            display_value = f"Current: {current_value * 100:.2f}%"
-                        elif ratio in ["DER", "P/E", "P/B", "P/S", "Current Ratio", "PEG Ratio"]:
-                            display_value = f"Current: {current_value:.2f}"
+            for j, ratio in enumerate(RATIO_KEYS):
+                with cols[j % 3]:
+                    value = ratio_data[stock].get(ratio)
+                    if value is not None and isinstance(value, float):
+                        if ratio in ("DER", "P/E", "P/B", "P/S", "Current Ratio", "PEG Ratio"):
+                            display_val = f"Current: {value:.2f}"
                         else:
-                            display_value = f"Current: {current_value:.2f}%"
+                            display_val = f"Current: {value:.2f}%"
                     else:
-                        display_value = "Current: N/A"
-                        has_na_values = True
+                        display_val = "Current: N/A"
+                        has_na = True
 
-                    st.text(display_value)
-
-                    # Create the input field with a unique key
-                    new_value = st.text_input(
+                    st.text(display_val)
+                    current_input = st.session_state.manual_values[stock].get(ratio, "")
+                    new_val = st.text_input(
                         f"Input {ratio}",
                         value=current_input,
-                        key=f"manual_input_{stock}_{ratio}_{i}"  # Added index to ensure uniqueness
+                        key=f"manual_input_{stock}_{ratio}_{i}",
                     )
+                    if new_val != current_input:
+                        st.session_state.manual_values[stock][ratio] = new_val
 
-                    # Store the value directly in session_state
-                    if new_value != current_input:
-                        st.session_state.manual_values[stock][ratio] = new_value
-
-            if not has_na_values:
+            if not has_na:
                 st.info("Semua nilai rasio sudah tersedia. Input manual akan menggantikan nilai yang ada.")
 
-    # Add "Analisa Kembali" button here (moved from main app logic)
+    # ── Re-analyze Button ────────────────────
     if st.button("Analisa Kembali", key="reanalyze_button_inside"):
         if not stocks:
             st.error("Masukkan minimal satu kode saham untuk dianalisis.")
         else:
-            with st.spinner('Menganalisis ulang data fundamental...'):
+            with st.spinner("Menganalisis ulang data fundamental..."):
                 if st.session_state.ratio_data:
-                    # Use existing data but re-evaluate with updated manual inputs
-                    ratio_data = st.session_state.ratio_data
-                    evaluations, scores = evaluate_ratios(ratio_data)
+                    evaluations, scores = evaluate_ratios(st.session_state.ratio_data)
                     st.session_state.evaluations = evaluations
                     st.session_state.scores = scores
-                    # Set flag to display results
                     st.session_state.should_display_results = True
-                    # Force rerun to display results
                     st.rerun()
 
-    # Generate recommendations
+    # ── Recommendations ──────────────────────
     st.subheader("REKOMENDASI")
 
-    # Filter stocks with at least 7 "Baik" ratings
-    good_counts = {stock: sum(1 for val in evals.values() if val == "Baik") for stock, evals in evaluations.items()}
-    qualified_stocks = {stock: scores[stock] for stock in stocks if good_counts[stock] >= 5}
+    good_counts = {
+        stock: sum(1 for v in evals.values() if v == "Baik")
+        for stock, evals in evaluations.items()
+    }
+    qualified = {s: scores[s] for s in stocks if good_counts.get(s, 0) >= 5}
 
-    if qualified_stocks:
-        # Sort by total score
-        sorted_stocks = sorted(qualified_stocks.items(), key=lambda x: x[1], reverse=True)
-
-        # Display top 3 or all if less than 3
-        top_stocks = sorted_stocks[:min(3, len(sorted_stocks))]
-
-        for i, (stock, score) in enumerate(top_stocks, 1):
-            st.write(f"{i}. **{stock}** - Total Score: {score}, Kriteria Baik: {good_counts[stock]}")
+    if qualified:
+        top = sorted(qualified.items(), key=lambda x: x[1], reverse=True)[:3]
+        for rank, (stock, score) in enumerate(top, 1):
+            st.write(f"{rank}. **{stock}** — Total Score: {score}, Kriteria Baik: {good_counts[stock]}")
     else:
-        st.write("Tidak ada Rekomendasi (Minimal 7 rasio harus dengan kriteria Baik)")
+        st.write("Tidak ada Rekomendasi (Minimal 5 rasio harus dengan kriteria Baik)")
 
-    # Display current date
-    current_date = dt.datetime.now().strftime("%d %B %Y")
-    st.write(f"Data diambil pada tanggal {current_date}")
+    st.write(f"Data diambil pada tanggal {dt.datetime.now().strftime('%d %B %Y')}")
 
-# Main app logic - Consolidated flow
-analyze_button = st.button("Analisis Fundamental")
 
-# Handle button clicks
-if analyze_button:
+# ─────────────────────────────────────────────
+# Main App Flow
+# ─────────────────────────────────────────────
+
+if st.button("Analisis Fundamental"):
     if not stocks:
         st.error("Masukkan minimal satu kode saham untuk dianalisis.")
     else:
-        with st.spinner('Menganalisis data fundamental...'):
-            # Get fresh data
+        with st.spinner("Menganalisis data fundamental..."):
             ratio_data = get_ratio_data(stocks)
-            # Store in session state
             st.session_state.ratio_data = ratio_data
-            # Evaluate with any existing manual inputs
             evaluations, scores = evaluate_ratios(ratio_data)
             st.session_state.evaluations = evaluations
             st.session_state.scores = scores
-            # Set flag to display results
             st.session_state.should_display_results = True
-            # Force rerun to display results
             st.rerun()
 
-# Display results if needed
 if st.session_state.should_display_results and st.session_state.ratio_data and stocks:
     display_results(
+        stocks,
         st.session_state.ratio_data,
         st.session_state.evaluations,
-        st.session_state.scores
+        st.session_state.scores,
     )
-# Sembunyikan tombol Fork & GitHub di Streamlit Cloud
+
+# ─────────────────────────────────────────────
+# Hide Streamlit Cloud fork/GitHub toolbar
+# ─────────────────────────────────────────────
 st.markdown(
     """
     <style>
-        /* Sembunyikan tombol Fork dan ikon GitHub */
-        .stApp [data-testid="stHeader"] {
-            display: none !important;
-        }
-        /* Jika ingin sembunyikan juga menu 3 titik (More options) */
-        .stApp [data-testid="stToolbar"] {
-            display: none !important;
-        }
+        .stApp [data-testid="stHeader"]  { display: none !important; }
+        .stApp [data-testid="stToolbar"] { display: none !important; }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
-
-
-
-
